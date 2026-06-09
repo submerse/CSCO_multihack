@@ -51,6 +51,26 @@ RADAR_TOGGLE = {0x0A20: 1,   0x0A24: 1}
 TB_POINTER_BASE = 0x00DEF97C
 TB_OFFSETS      = [0x24, 0x4, 0x68]
 
+# ─── Nord Color Palette ──────────────────────────────────────────────────────
+
+NORD = {
+    "bg":        "#2E3440",  # Polar Night 0 — darkest bg
+    "bg_light":  "#3B4252",  # Polar Night 1
+    "bg_mid":    "#434C5E",  # Polar Night 2
+    "bg_hover":  "#4C566A",  # Polar Night 3
+    "fg":        "#D8DEE9",  # Snow Storm 0
+    "fg_dim":    "#81A1C1",  # Frost 3 — muted label text
+    "fg_bright": "#ECEFF4",  # Snow Storm 2
+    "teal":      "#8FBCBB",  # Frost 0
+    "frost":     "#88C0D0",  # Frost 1 — primary accent
+    "blue":      "#5E81AC",  # Frost 3 — darker accent
+    "red":       "#BF616A",  # Aurora red
+    "orange":    "#D08770",  # Aurora orange
+    "yellow":    "#EBCB8B",  # Aurora yellow
+    "green":     "#A3BE8C",  # Aurora green
+    "purple":    "#B48EAD",  # Aurora purple
+}
+
 # ─── Shared state ────────────────────────────────────────────────────────────
 
 shared = {
@@ -75,6 +95,10 @@ shared = {
     "correction_speed_2":   0.05,
     "last_target_ptr":      None,
     "desired_fov":          4.0,
+    "fov_circle":           False,
+    "aim_enabled":          True,
+    "tb_enabled":           True,
+    "esp_enabled":          True,
     # triggerbot
     "tb_active_key":  "CAPS_LOCK",
     "tb_datatype":    "FLOAT",
@@ -176,17 +200,92 @@ def tb_read_value(pm, address, datatype):
         return None
 
 
+# ─── Dormancy probe ──────────────────────────────────────────────────────────
+
+def probe_dormancy(pm, entity_list):
+    """
+    Dump bytes 0xE0-0xFF for every entity that has a valid team + health.
+    Run this in-game:
+      - once standing right next to a visible enemy  (real entity  → dormant byte = 0x00)
+      - once with only ghost boxes visible            (stale entity → dormant byte = 0x01)
+    Whichever offset flips between the two runs is m_bDormant.
+    """
+    PROBE_START  = 0xD0
+    PROBE_LEN    = 64          # covers 0xD0 – 0x10F
+
+    print("\n" + "═" * 72)
+    print("  DORMANCY PROBE  —  offsets 0xE0 … 0xFF")
+    print("  Look for a byte that is 00 on real enemies and 01 on ghosts.")
+    print("═" * 72)
+    header = "  off →  " + "  ".join(f"{PROBE_START+j:02X}" for j in range(PROBE_LEN))
+    print(f"  (team offset=0xEC, health offset=0xF8 — use these as anchors)")
+    print(header)
+    print("─" * 72)
+
+    for i in range(MAX_ENTITIES):
+        try:
+            ent_ptr = pm.read_uint(entity_list + i * ENTITY_STRIDE)
+            if not ent_ptr:
+                continue
+            team   = pm.read_int(ent_ptr + TEAM_OFFSET)
+            health = pm.read_int(ent_ptr + HEALTH_OFFSET)
+            if team not in (2, 3) or health <= 0 or health > 200:
+                continue
+
+            raw     = pm.read_bytes(ent_ptr + PROBE_START, PROBE_LEN)
+            hex_row = "  ".join(f"{b:02X}" for b in raw)
+            x = pm.read_float(ent_ptr + POS_X)
+            y = pm.read_float(ent_ptr + POS_Y)
+            print(f"  [{i:2d}] team={team} hp={health:3d}  pos=({x:7.1f},{y:7.1f})")
+            print(f"         {hex_row}")
+        except:
+            continue
+
+    print("═" * 72 + "\n")
+
+
 # ─── Feature threads ─────────────────────────────────────────────────────────
 
 def esp_loop(pm, client, entity_list, canvas, root):
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
 
+    dormant_last_valid = {}  # entity index → timestamp of last dormant=0 read
+
+    def render(cmds):
+        canvas.delete("all")
+        for cmd in cmds:
+            kind = cmd[0]
+            if kind == "box":
+                canvas.create_rectangle(cmd[1], cmd[2], cmd[3], cmd[4],
+                                        outline=cmd[5], width=2)
+            elif kind == "bar":
+                canvas.create_rectangle(cmd[1], cmd[2], cmd[3], cmd[4],
+                                        fill=cmd[5], outline=cmd[6])
+            elif kind == "name":
+                canvas.create_text(cmd[1]+1, cmd[2]+1, text=cmd[3],
+                                   fill=NORD["bg"], font=("Arial", 10, "bold"))
+                canvas.create_text(cmd[1], cmd[2], text=cmd[3],
+                                   fill=NORD["fg_bright"], font=("Arial", 10, "bold"))
+            elif kind == "head":
+                r = cmd[3]
+                canvas.create_oval(cmd[1]-r, cmd[2]-r, cmd[1]+r, cmd[2]+r,
+                                   outline=NORD["frost"], width=2)
+            elif kind == "fov":
+                r = cmd[3]
+                canvas.create_oval(cmd[1]-r, cmd[2]-r, cmd[1]+r, cmd[2]+r,
+                                   outline=NORD["blue"], width=1, dash=(4, 4))
+
     while shared["running"]:
+        t0 = time.perf_counter()
         try:
             if not canvas.winfo_exists():
                 break
-            canvas.delete("all")
+
+            if not shared["esp_enabled"]:
+                root.after(0, canvas.delete, "all")
+                time.sleep(0.05)
+                continue
 
             try:
                 view_matrix = struct.unpack("16f", pm.read_bytes(client + VIEW_MATRIX_OFFSET, 64))
@@ -212,11 +311,20 @@ def esp_loop(pm, client, entity_list, canvas, root):
                 time.sleep(0.03)
                 continue
 
+            cmds = []
+
             for i in range(MAX_ENTITIES):
                 try:
                     ent_ptr = pm.read_uint(entity_list + i * ENTITY_STRIDE)
                     if not ent_ptr or ent_ptr == local_ptr:
                         continue
+
+                    dormant = pm.read_bytes(ent_ptr + 0xE5, 1)[0]
+                    if dormant:
+                        if time.time() - dormant_last_valid.get(i, 0) > 30.0:
+                            continue  # never seen active, or gone for >30s — true ghost
+                    else:
+                        dormant_last_valid[i] = time.time()
 
                     ent_team = pm.read_int(ent_ptr + TEAM_OFFSET)
                     if ent_team == 0:
@@ -230,6 +338,9 @@ def esp_loop(pm, client, entity_list, canvas, root):
                     ex = pm.read_float(ent_ptr + POS_X)
                     ey = pm.read_float(ent_ptr + POS_Y)
                     ez = pm.read_float(ent_ptr + POS_Z)
+                    if (math.isnan(ex) or math.isnan(ey) or math.isnan(ez)
+                            or abs(ex) > 16384 or abs(ey) > 16384 or abs(ez) > 4096):
+                        continue
                     crouch = pm.read_float(ent_ptr + CROUCH_OFFSET)
 
                     delta  = max(0.0, min(1.0, (72.0 - crouch) / 18.0))
@@ -247,15 +358,15 @@ def esp_loop(pm, client, entity_list, canvas, root):
                     x1, y1 = fx - box_w//2, hy
                     x2, y2 = fx + box_w//2, fy
 
-                    box_color = "blue" if is_teammate else "red"
-                    canvas.create_rectangle(x1, y1, x2, y2, outline=box_color, width=2)
+                    box_color = NORD["teal"] if is_teammate else NORD["red"]
+                    cmds.append(("box", x1, y1, x2, y2, box_color))
 
-                    hp_pct    = max(0.0, min(health / 100.0, 1.0))
-                    filled_h  = int((y2-y1) * hp_pct)
-                    bar_color = "green" if hp_pct > 0.66 else "orange" if hp_pct > 0.33 else "red"
-                    bx1, bx2  = x1-8, x1-3
-                    canvas.create_rectangle(bx1, y1,          bx2, y2, fill="gray",     outline="black")
-                    canvas.create_rectangle(bx1, y2-filled_h, bx2, y2, fill=bar_color,  outline=bar_color)
+                    hp_pct   = max(0.0, min(health / 100.0, 1.0))
+                    filled_h = int((y2-y1) * hp_pct)
+                    bar_color = NORD["green"] if hp_pct > 0.66 else NORD["yellow"] if hp_pct > 0.33 else NORD["red"]
+                    bx1, bx2 = x1-8, x1-3
+                    cmds.append(("bar", bx1, y1,          bx2, y2, NORD["bg_hover"], NORD["bg_light"]))
+                    cmds.append(("bar", bx1, y2-filled_h, bx2, y2, bar_color,        bar_color))
 
                     try:
                         ent2_ptr   = entity_list_2 + i * NAME_ENTITY_STRIDE
@@ -263,9 +374,8 @@ def esp_loop(pm, client, entity_list, canvas, root):
                         name       = name_bytes.split(b'\x00')[0].decode("utf-8", errors="ignore")
                     except:
                         name = "?"
-                    canvas.create_text(fx, y1-15, text=name, fill="white", font=("Arial", 10, "bold"))
+                    cmds.append(("name", fx, y1-15, name))
 
-                    # Head circle via highest bone
                     try:
                         bm_ptr = pm.read_uint(ent_ptr + 0x26A0)
                         if bm_ptr:
@@ -282,14 +392,12 @@ def esp_loop(pm, client, entity_list, canvas, root):
                             if best_bone:
                                 bone_screen = world_to_screen(best_bone, view_matrix, sw, sh)
                                 if bone_screen:
-                                    cx, cy = bone_screen
-                                    above  = (best_bone[0], best_bone[1], best_bone[2] + 7.0)
+                                    bcx, bcy = bone_screen
+                                    above        = (best_bone[0], best_bone[1], best_bone[2] + 7.0)
                                     above_screen = world_to_screen(above, view_matrix, sw, sh)
                                     if above_screen:
-                                        radius = max(3, abs(cy - above_screen[1]))
-                                        canvas.create_oval(cx-radius, cy-radius,
-                                                           cx+radius, cy+radius,
-                                                           outline="yellow", width=2.0)
+                                        r = max(3, abs(bcy - above_screen[1]))
+                                        cmds.append(("head", bcx, bcy, r))
                     except:
                         pass
 
@@ -298,10 +406,18 @@ def esp_loop(pm, client, entity_list, canvas, root):
                 except:
                     continue
 
+            if shared["fov_circle"]:
+                fov_r = int((sw / 2) * math.tan(math.radians(shared["desired_fov"]))
+                            / math.tan(math.radians(53.13)))
+                cmds.append(("fov", sw // 2, sh // 2, fov_r))
+
+            root.after(0, render, cmds)
+
         except Exception as e:
             print(f"[ESP ERROR]: {e}")
 
-        time.sleep(0.03)
+        elapsed = time.perf_counter() - t0
+        time.sleep(max(0.0, 0.016 - elapsed))
 
 
 def radar_thread(pm, entity_list):
@@ -398,7 +514,7 @@ def aimbot_thread(pm, entity_list, pitch_addr, yaw_addr):
 
     while shared["running"]:
         now = time.time()
-        if now < cooldown_until or not shared["aim_active"]:
+        if now < cooldown_until or not shared["aim_active"] or not shared["aim_enabled"]:
             shared["enemy_in_fov"]          = False
             shared["left_hold_start"]        = None
             shared["current_pitch_correction"] = 0.0
@@ -534,7 +650,10 @@ def triggerbot_thread(pm, client):
             else:
                 activate = shared["tb_key_pressed"]
 
-            if activate:
+            if not shared["tb_enabled"]:
+                shared["tb_status"] = "Disabled"
+                prev_value = None
+            elif activate:
                 if prev_value is None:
                     prev_value = value
                 elif value != prev_value:
@@ -558,7 +677,7 @@ def triggerbot_thread(pm, client):
         time.sleep(0.01)
 
 
-def combined_hotkey_listener():
+def combined_hotkey_listener(pm, entity_list):
     def on_click(x, y, button, pressed):
         btn_name = str(button).replace("Button.", "").upper()
         # Aimbot hotkey (mouse)
@@ -578,6 +697,10 @@ def combined_hotkey_listener():
                 shared["tb_middle_mouse"] = pressed
 
     def on_press(key):
+        # Dormancy probe
+        if key == keyboard.Key.f9:
+            threading.Thread(target=probe_dormancy,
+                             args=(pm, entity_list), daemon=True).start()
         # Aimbot hotkey (keyboard)
         if str(key) == shared["hotkey"]:
             shared["aim_active"] = True
@@ -620,55 +743,156 @@ def make_window_clickthrough(hwnd):
 
 def build_config_window(root):
     win = tk.Toplevel(root)
-    win.title("CS:GO Tool Config")
-    win.geometry("320x500")
+    win.title("CS:GO Tool")
+    win.geometry("380x560")
     win.resizable(False, False)
+    win.configure(bg=NORD["bg"])
+
+    # ttk Style
+    style = ttk.Style(win)
+    style.theme_use("clam")
+    style.configure("TNotebook",
+                    background=NORD["bg_light"], borderwidth=0,
+                    tabmargins=[0, 2, 0, 0])
+    style.configure("TNotebook.Tab",
+                    background=NORD["bg_light"], foreground=NORD["fg_dim"],
+                    padding=[14, 7], font=("Segoe UI", 9, "bold"), borderwidth=0)
+    style.map("TNotebook.Tab",
+              background=[("selected", NORD["bg"]), ("active", NORD["bg_mid"])],
+              foreground=[("selected", NORD["frost"]), ("active", NORD["fg"])])
+    style.configure("TFrame", background=NORD["bg"])
+    style.configure("TCombobox",
+                    fieldbackground=NORD["bg_mid"], background=NORD["bg_light"],
+                    foreground=NORD["fg"], selectbackground=NORD["blue"],
+                    selectforeground=NORD["fg_bright"], arrowcolor=NORD["frost"],
+                    borderwidth=1, relief="flat")
+    style.map("TCombobox",
+              fieldbackground=[("readonly", NORD["bg_mid"]), ("focus", NORD["bg_mid"])],
+              background=[("active", NORD["bg_light"])],
+              foreground=[("disabled", NORD["bg_mid"])])
+    win.option_add("*TCombobox*Listbox.background",       NORD["bg_mid"])
+    win.option_add("*TCombobox*Listbox.foreground",       NORD["fg"])
+    win.option_add("*TCombobox*Listbox.selectBackground", NORD["blue"])
+    win.option_add("*TCombobox*Listbox.selectForeground", NORD["fg_bright"])
+
+    # Title bar
+    hdr = tk.Frame(win, bg=NORD["bg_light"], height=44)
+    hdr.pack(fill="x")
+    hdr.pack_propagate(False)
+    tk.Frame(hdr, bg=NORD["frost"], width=4).pack(side="left", fill="y")
+    tk.Label(hdr, text="  CS:GO TOOL", bg=NORD["bg_light"], fg=NORD["fg_bright"],
+             font=("Segoe UI", 11, "bold")).pack(side="left", padx=6, pady=10)
+    tk.Label(hdr, text="v1.0  ", bg=NORD["bg_light"], fg=NORD["bg_hover"],
+             font=("Segoe UI", 8)).pack(side="right", pady=14)
 
     nb = ttk.Notebook(win)
     nb.pack(fill="both", expand=True)
 
+    # ── Widget helpers ────────────────────────────────────────────────────
+    def _section(parent, text):
+        f = tk.Frame(parent, bg=NORD["bg"])
+        tk.Label(f, text=text, bg=NORD["bg"], fg=NORD["frost"],
+                 font=("Segoe UI", 7, "bold")).pack(side="left")
+        tk.Frame(f, bg=NORD["bg_mid"], height=1).pack(
+            side="left", fill="x", expand=True, padx=(6, 0), pady=6)
+        return f
+
+    def _slider(parent, from_, to, res, cmd=None):
+        return tk.Scale(parent, from_=from_, to=to, resolution=res,
+                        orient="horizontal", length=310,
+                        bg=NORD["bg"], fg=NORD["fg"], troughcolor=NORD["bg_mid"],
+                        activebackground=NORD["frost"], highlightthickness=0,
+                        sliderrelief="flat", font=("Segoe UI", 8), bd=0,
+                        command=cmd)
+
+    def _btn(parent, text, cmd, accent=NORD["blue"]):
+        b = tk.Button(parent, text=text, command=cmd,
+                      bg=NORD["bg_mid"], fg=NORD["fg"],
+                      activebackground=accent, activeforeground=NORD["fg_bright"],
+                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                      cursor="hand2", pady=8, padx=12)
+        b.bind("<Enter>", lambda e: b.config(bg=accent, fg=NORD["fg_bright"]))
+        b.bind("<Leave>", lambda e: b.config(bg=NORD["bg_mid"], fg=NORD["fg"]))
+        return b
+
+    PX = {"padx": 16}
+
     # ── Aimbot tab ────────────────────────────────────────────────────────
     tab_aim = ttk.Frame(nb)
-    nb.add(tab_aim, text="Aimbot")
+    nb.add(tab_aim, text=" Aimbot ")
 
-    tk.Label(tab_aim, text="Recoil:").pack()
-    recoil_slider = tk.Scale(tab_aim, from_=0.0, to=80.0, resolution=0.01, orient="horizontal")
+    aim_enabled_var = tk.BooleanVar(value=shared["aim_enabled"])
+    tk.Checkbutton(tab_aim, text="Enable Aimbot",
+                   variable=aim_enabled_var,
+                   command=lambda: shared.update({"aim_enabled": aim_enabled_var.get()}),
+                   bg=NORD["bg"], fg=NORD["fg"], selectcolor=NORD["bg_mid"],
+                   activebackground=NORD["bg"], activeforeground=NORD["fg_bright"],
+                   font=("Segoe UI", 10, "bold"), bd=0, highlightthickness=0,
+                   cursor="hand2").pack(**PX, pady=(10, 4), anchor="w")
+    tk.Frame(tab_aim, bg=NORD["bg_mid"], height=1).pack(fill="x", **PX, pady=(0, 4))
+
+    _section(tab_aim, "RECOIL CONTROL").pack(fill="x", **PX, pady=(12, 0))
+    recoil_slider = _slider(tab_aim, 0.0, 80.0, 0.01)
     recoil_slider.set(shared["recoil"])
-    recoil_slider.pack()
+    recoil_slider.pack(**PX)
 
-    tk.Label(tab_aim, text="Smoothing:").pack()
-    smooth_slider = tk.Scale(tab_aim, from_=0.0, to=1.0, resolution=0.01, orient="horizontal")
+    _section(tab_aim, "SMOOTHING").pack(fill="x", **PX, pady=(8, 0))
+    smooth_slider = _slider(tab_aim, 0.0, 1.0, 0.01)
     smooth_slider.set(shared["correction_speed"])
-    smooth_slider.pack()
+    smooth_slider.pack(**PX)
 
-    tk.Label(tab_aim, text="FOV:").pack()
-    fov_slider = tk.Scale(tab_aim, from_=1, to=30, resolution=0.1, orient="horizontal", length=200,
-                          command=lambda v: shared.update({"desired_fov": float(v)}))
+    _section(tab_aim, "FIELD OF VIEW").pack(fill="x", **PX, pady=(8, 0))
+    fov_slider = _slider(tab_aim, 1, 30, 0.1,
+                         cmd=lambda v: shared.update({"desired_fov": float(v)}))
     fov_slider.set(shared["desired_fov"])
-    fov_slider.pack()
+    fov_slider.pack(**PX)
 
-    tk.Label(tab_aim, text="Hotkey:").pack()
+    fov_circle_var = tk.BooleanVar(value=shared["fov_circle"])
+    tk.Checkbutton(tab_aim, text="Show FOV Circle",
+                   variable=fov_circle_var,
+                   command=lambda: shared.update({"fov_circle": fov_circle_var.get()}),
+                   bg=NORD["bg"], fg=NORD["fg_dim"], selectcolor=NORD["bg_mid"],
+                   activebackground=NORD["bg"], activeforeground=NORD["fg_bright"],
+                   font=("Segoe UI", 9), bd=0, highlightthickness=0,
+                   cursor="hand2").pack(**PX, pady=(2, 0), anchor="w")
+
+    _section(tab_aim, "HOTKEY").pack(fill="x", **PX, pady=(8, 0))
     hotkey_var     = tk.StringVar(value=shared["hotkey"])
     hotkey_options = ["Key.shift", "Key.ctrl", "Key.alt", "Key.space", "2",
                       "Button.left", "Button.right", "Button.middle"]
-    tk.OptionMenu(tab_aim, hotkey_var, *hotkey_options,
-                  command=lambda v: shared.update({"hotkey": v})).pack()
+    om = tk.OptionMenu(tab_aim, hotkey_var, *hotkey_options,
+                       command=lambda v: shared.update({"hotkey": v}))
+    om.config(bg=NORD["bg_mid"], fg=NORD["fg"],
+              activebackground=NORD["blue"], activeforeground=NORD["fg_bright"],
+              highlightthickness=0, relief="flat", font=("Segoe UI", 9), width=24, bd=0)
+    om["menu"].config(bg=NORD["bg_mid"], fg=NORD["fg"],
+                      activebackground=NORD["blue"], activeforeground=NORD["fg_bright"],
+                      relief="flat", bd=0)
+    om.pack(**PX, pady=(2, 0), anchor="w")
 
-    team_label  = tk.Label(tab_aim, text=f"Team: {shared['my_team']}")
-    index_label = tk.Label(tab_aim, text=f"Local Index: {shared['local_index']}")
-    team_label.pack()
-    index_label.pack()
+    tk.Frame(tab_aim, bg=NORD["bg_mid"], height=1).pack(fill="x", **PX, pady=10)
+
+    info_row = tk.Frame(tab_aim, bg=NORD["bg"])
+    info_row.pack(**PX, fill="x")
+    team_label  = tk.Label(info_row, text=f"Team: {shared['my_team']}",
+                           bg=NORD["bg_mid"], fg=NORD["frost"],
+                           font=("Segoe UI", 9, "bold"), padx=10, pady=4)
+    index_label = tk.Label(info_row, text=f"Index: {shared['local_index']}",
+                           bg=NORD["bg_mid"], fg=NORD["teal"],
+                           font=("Segoe UI", 9, "bold"), padx=10, pady=4)
+    team_label.pack(side="left", padx=(0, 6))
+    index_label.pack(side="left")
 
     def update_aim_labels():
         shared["recoil"]           = recoil_slider.get()
         shared["correction_speed"] = smooth_slider.get()
         team_label.config(text=f"Team: {shared['my_team']}")
-        index_label.config(text=f"Local Index: {shared['local_index']}")
+        index_label.config(text=f"Index: {shared['local_index']}")
         win.after(300, update_aim_labels)
 
     update_aim_labels()
 
-    # F1-F6 preset keys (same bindings as original gui51_head.py)
+    # F1-F6 preset keys
     def f_key_listener():
         def on_press(key):
             try:
@@ -687,9 +911,19 @@ def build_config_window(root):
 
     # ── Triggerbot tab ────────────────────────────────────────────────────
     tab_tb = ttk.Frame(nb)
-    nb.add(tab_tb, text="Triggerbot")
+    nb.add(tab_tb, text=" Triggerbot ")
 
-    tk.Label(tab_tb, text="Activation Key:").pack(pady=5)
+    tb_enabled_var = tk.BooleanVar(value=shared["tb_enabled"])
+    tk.Checkbutton(tab_tb, text="Enable Triggerbot",
+                   variable=tb_enabled_var,
+                   command=lambda: shared.update({"tb_enabled": tb_enabled_var.get()}),
+                   bg=NORD["bg"], fg=NORD["fg"], selectcolor=NORD["bg_mid"],
+                   activebackground=NORD["bg"], activeforeground=NORD["fg_bright"],
+                   font=("Segoe UI", 10, "bold"), bd=0, highlightthickness=0,
+                   cursor="hand2").pack(**PX, pady=(10, 4), anchor="w")
+    tk.Frame(tab_tb, bg=NORD["bg_mid"], height=1).pack(fill="x", **PX, pady=(0, 4))
+
+    _section(tab_tb, "ACTIVATION KEY").pack(fill="x", **PX, pady=(12, 0))
     tb_key_var = tk.StringVar(value=shared["tb_active_key"])
     tb_key_options = [
         "A","B","C","D","E","F","G","H","I","J","K","L","M",
@@ -697,41 +931,65 @@ def build_config_window(root):
         "SPACE","TAB","CAPS_LOCK","CTRL","LEFT","RIGHT","MIDDLE",
     ]
     tb_key_combo = ttk.Combobox(tab_tb, values=tb_key_options,
-                                textvariable=tb_key_var, state="readonly")
-    tb_key_combo.pack(pady=5)
+                                textvariable=tb_key_var, state="readonly",
+                                font=("Segoe UI", 9), width=30)
+    tb_key_combo.pack(**PX, pady=(4, 0), anchor="w")
     tb_key_combo.bind("<<ComboboxSelected>>",
                       lambda e: shared.update({"tb_active_key": tb_key_var.get()}))
 
-    tk.Label(tab_tb, text="Data Type:").pack(pady=5)
+    _section(tab_tb, "DATA TYPE").pack(fill="x", **PX, pady=(12, 0))
     tb_type_var = tk.StringVar(value=shared["tb_datatype"])
-    tb_type_combo = ttk.Combobox(tab_tb, values=["INT","FLOAT","DOUBLE","BYTE"],
-                                 textvariable=tb_type_var, state="readonly")
-    tb_type_combo.pack(pady=5)
+    tb_type_combo = ttk.Combobox(tab_tb, values=["INT", "FLOAT", "DOUBLE", "BYTE"],
+                                 textvariable=tb_type_var, state="readonly",
+                                 font=("Segoe UI", 9), width=30)
+    tb_type_combo.pack(**PX, pady=(4, 0), anchor="w")
     tb_type_combo.bind("<<ComboboxSelected>>",
                        lambda e: shared.update({"tb_datatype": tb_type_var.get()}))
 
-    tb_status_label = tk.Label(tab_tb, text="Status: Waiting", fg="blue", wraplength=280)
-    tb_status_label.pack(pady=5)
+    tk.Frame(tab_tb, bg=NORD["bg_mid"], height=1).pack(fill="x", **PX, pady=14)
+
+    status_bar = tk.Frame(tab_tb, bg=NORD["bg_mid"])
+    status_bar.pack(**PX, fill="x")
+    tk.Label(status_bar, text=" STATUS ", bg=NORD["blue"], fg=NORD["fg_bright"],
+             font=("Segoe UI", 7, "bold"), padx=4).pack(side="left")
+    tb_status_label = tk.Label(status_bar, text="Waiting",
+                               bg=NORD["bg_mid"], fg=NORD["frost"],
+                               font=("Segoe UI", 9), padx=8, pady=4, wraplength=260)
+    tb_status_label.pack(side="left", fill="x", expand=True)
 
     def update_tb_status():
         status = shared["tb_status"]
-        color  = "green" if "Fired" in status else "red" if "Error" in status else "blue"
-        tb_status_label.config(text=f"Status: {status}", fg=color)
+        color  = NORD["green"] if "Fired" in status else NORD["red"] if "Error" in status else NORD["frost"]
+        tb_status_label.config(text=status, fg=color)
         win.after(100, update_tb_status)
 
     update_tb_status()
 
     # ── ESP / Team tab ────────────────────────────────────────────────────
     tab_esp = ttk.Frame(nb)
-    nb.add(tab_esp, text="ESP / Team")
+    nb.add(tab_esp, text=" ESP / Team ")
 
-    tk.Label(tab_esp, text="Team Mode:", font=("Arial", 12, "bold")).pack(pady=10)
-    tk.Button(tab_esp, text="Auto Detect",    width=15,
-              command=lambda: shared.update({"team_mode": "auto"})).pack(pady=5)
-    tk.Button(tab_esp, text="Manual: Team 2", width=15,
-              command=lambda: shared.update({"team_mode": "manual2"})).pack(pady=5)
-    tk.Button(tab_esp, text="Manual: Team 3", width=15,
-              command=lambda: shared.update({"team_mode": "manual3"})).pack(pady=5)
+    esp_enabled_var = tk.BooleanVar(value=shared["esp_enabled"])
+    tk.Checkbutton(tab_esp, text="Enable ESP",
+                   variable=esp_enabled_var,
+                   command=lambda: shared.update({"esp_enabled": esp_enabled_var.get()}),
+                   bg=NORD["bg"], fg=NORD["fg"], selectcolor=NORD["bg_mid"],
+                   activebackground=NORD["bg"], activeforeground=NORD["fg_bright"],
+                   font=("Segoe UI", 10, "bold"), bd=0, highlightthickness=0,
+                   cursor="hand2").pack(**PX, pady=(10, 4), anchor="w")
+    tk.Frame(tab_esp, bg=NORD["bg_mid"], height=1).pack(fill="x", **PX, pady=(0, 4))
+
+    _section(tab_esp, "TEAM MODE").pack(fill="x", **PX, pady=(12, 0))
+
+    _btn(tab_esp, "Auto Detect",
+         lambda: shared.update({"team_mode": "auto"}),
+         accent=NORD["teal"]).pack(**PX, fill="x", pady=(8, 4))
+    _btn(tab_esp, "Manual: Team 2 (CT)",
+         lambda: shared.update({"team_mode": "manual2"}),
+         accent=NORD["blue"]).pack(**PX, fill="x", pady=4)
+    _btn(tab_esp, "Manual: Team 3 (T)",
+         lambda: shared.update({"team_mode": "manual3"}),
+         accent=NORD["red"]).pack(**PX, fill="x", pady=4)
 
     # Prevent closing the config window independently
     win.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -817,7 +1075,7 @@ def main():
     else:
         print("[WARN] Aimbot thread not started – pitch/yaw addresses unavailable")
 
-    combined_hotkey_listener()  # starts pynput listeners (non-blocking)
+    combined_hotkey_listener(pm, entity_list)  # starts pynput listeners (non-blocking)
 
     root.mainloop()
     shared["running"] = False
