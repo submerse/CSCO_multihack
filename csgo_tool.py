@@ -508,7 +508,18 @@ def detect_local_player(pm, client, entity_list):
         time.sleep(10.0)
 
 
-def aimbot_thread(pm, entity_list, pitch_addr, yaw_addr):
+def _resolve_aim_addrs(pm, stdshader):
+    try:
+        pitch_ptr  = pm.read_uint(stdshader + PITCH_BASE_OFFSET)
+        pitch_addr = pm.read_uint(pitch_ptr  + PTR_OFFSET_1) + PITCH_FINAL_OFFSET
+        yaw_ptr    = pm.read_uint(stdshader  + YAW_BASE_OFFSET)
+        yaw_addr   = pm.read_uint(yaw_ptr    + PTR_OFFSET_1) + YAW_FINAL_OFFSET
+        return pitch_addr, yaw_addr
+    except:
+        return None, None
+
+
+def aimbot_thread(pm, entity_list, stdshader):
     cooldown_until = 0
     target_ptr     = None
 
@@ -522,6 +533,12 @@ def aimbot_thread(pm, entity_list, pitch_addr, yaw_addr):
             continue
 
         try:
+            pitch_addr, yaw_addr = _resolve_aim_addrs(pm, stdshader)
+            if pitch_addr is None or yaw_addr is None:
+                shared["enemy_in_fov"] = False
+                time.sleep(0.1)
+                continue
+
             local_ptr = pm.read_uint(entity_list + shared["local_index"] * ENTITY_STRIDE)
             if local_ptr == 0:
                 shared["enemy_in_fov"]          = False
@@ -1018,16 +1035,6 @@ def main():
 
     entity_list = client + ENTITY_LIST_OFFSET
 
-    # Resolve pitch/yaw write addresses for aimbot
-    pitch_addr = yaw_addr = None
-    if stdshader:
-        try:
-            pitch_ptr  = pm.read_uint(stdshader + PITCH_BASE_OFFSET)
-            pitch_addr = pm.read_uint(pitch_ptr + PTR_OFFSET_1) + PITCH_FINAL_OFFSET
-            yaw_ptr    = pm.read_uint(stdshader + YAW_BASE_OFFSET)
-            yaw_addr   = pm.read_uint(yaw_ptr   + PTR_OFFSET_1) + YAW_FINAL_OFFSET
-        except Exception as e:
-            print(f"[WARN] Could not resolve pitch/yaw addresses: {e}")
 
     # Initial team read
     try:
@@ -1069,11 +1076,11 @@ def main():
     threading.Thread(target=triggerbot_thread,
                      args=(pm, client),                        daemon=True).start()
 
-    if pitch_addr and yaw_addr:
+    if stdshader:
         threading.Thread(target=aimbot_thread,
-                         args=(pm, entity_list, pitch_addr, yaw_addr), daemon=True).start()
+                         args=(pm, entity_list, stdshader), daemon=True).start()
     else:
-        print("[WARN] Aimbot thread not started – pitch/yaw addresses unavailable")
+        print("[WARN] Aimbot thread not started – stdshader_dx9.dll not found")
 
     combined_hotkey_listener(pm, entity_list)  # starts pynput listeners (non-blocking)
 
